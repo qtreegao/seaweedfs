@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -113,6 +114,51 @@ func TestFileVsFileConflict(t *testing.T) {
 	diffDir := makeResp("/dir2", "file.txt", false, 4, true)
 	if p.conflictsWith(diffDir) {
 		t.Error("unexpected conflict for file in different directory")
+	}
+}
+
+func TestMetadataProcessorMetricsCallbacks(t *testing.T) {
+	var pending []int64
+	var completed []error
+	var mu sync.Mutex
+	p := NewMetadataProcessor(func(resp *filer_pb.SubscribeMetadataResponse) error {
+		if resp.TsNs == 2 {
+			return errors.New("permanent failure")
+		}
+		return nil
+	}, 1, 0)
+	p.SetMetricsCallbacks(func(value int64) {
+		mu.Lock()
+		pending = append(pending, value)
+		mu.Unlock()
+	}, func(err error) {
+		mu.Lock()
+		completed = append(completed, err)
+		mu.Unlock()
+	})
+
+	p.AddSyncJob(makeResp("/dir", "ok", false, 1, true))
+	waitForJobsToDrain(t, p)
+	p.AddSyncJob(makeResp("/dir", "failed", false, 2, true))
+	waitForJobsToDrain(t, p)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		done := len(completed) == 2
+		mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(pending) < 4 || pending[0] != 1 || pending[1] != 0 {
+		t.Fatalf("pending callbacks = %v, want at least [1 0]", pending)
+	}
+	if len(completed) != 2 || completed[0] != nil || completed[1] == nil {
+		t.Fatalf("completion callbacks = %v, want success then failure", completed)
 	}
 }
 

@@ -383,6 +383,39 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDi
 		concurrency = DefaultConcurrencyLimit
 	}
 	processor := NewMetadataProcessor(processEventFn, concurrency, sourceFilerOffsetTsNs)
+	clientName := fmt.Sprintf("syncFrom_%s_To_%s", string(sourceFiler), string(targetFiler))
+	metricLabels := []string{sourceFiler.String(), targetFiler.String(), clientName, sourcePath}
+	latestSourceTsNs := atomic.Int64{}
+	updateLag := func(sourceTsNs int64) {
+		if sourceTsNs <= 0 {
+			return
+		}
+		latestSourceTsNs.Store(sourceTsNs)
+		watermark := processor.processedTsWatermark.Load()
+		if watermark <= 0 {
+			statsCollect.FilerSyncLagSecondsGauge.WithLabelValues(metricLabels...).Set(0)
+			return
+		}
+		lagSeconds := float64(sourceTsNs-watermark) / 1e9
+		if lagSeconds < 0 {
+			lagSeconds = 0
+		}
+		statsCollect.FilerSyncLagSecondsGauge.WithLabelValues(metricLabels...).Set(lagSeconds)
+	}
+	statsCollect.FilerSyncPendingTasksGauge.WithLabelValues(metricLabels...).Set(0)
+	processor.SetMetricsCallbacks(
+		func(pending int64) {
+			statsCollect.FilerSyncPendingTasksGauge.WithLabelValues(metricLabels...).Set(float64(pending))
+		},
+		func(jobErr error) {
+			if jobErr != nil {
+				statsCollect.FilerSyncFailedCounter.WithLabelValues(metricLabels...).Inc()
+			} else {
+				statsCollect.FilerSyncProcessedCounter.WithLabelValues(metricLabels...).Inc()
+			}
+			updateLag(latestSourceTsNs.Load())
+		},
+	)
 
 	// update sync state for graceful shutdown checkpoint saving
 	if statePtr != nil {
@@ -398,8 +431,9 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDi
 
 	var lastLogTsNs = time.Now().UnixNano()
 	var lastProgressedTsNs int64
-	var clientName = fmt.Sprintf("syncFrom_%s_To_%s", string(sourceFiler), string(targetFiler))
 	processEventFnWithOffset := pb.AddOffsetFunc(func(resp *filer_pb.SubscribeMetadataResponse) error {
+		updateLag(resp.TsNs)
+		statsCollect.FilerSyncReceivedCounter.WithLabelValues(metricLabels...).Inc()
 		processor.AddSyncJob(resp)
 		return nil
 	}, 3*time.Second, func(counter int64, lastTsNs int64) error {
@@ -425,6 +459,7 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDi
 		lastProgressedTsNs = offsetTsNs
 		// collect synchronous offset
 		statsCollect.FilerSyncOffsetGauge.WithLabelValues(sourceFiler.String(), targetFiler.String(), clientName, sourcePath).Set(float64(offsetTsNs))
+		updateLag(latestSourceTsNs.Load())
 		return setOffset(targetGrpcDialOption, targetFiler, signaturePrefix, sourceFilerSignature, offsetTsNs)
 	})
 
@@ -449,6 +484,8 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDi
 		// The idle heartbeat moves the gauge to the source's current time once we
 		// are caught up, so now-sync_offset reflects real lag and stays alertable.
 		OnIdleHeartbeat: func(tsNs int64) {
+			latestSourceTsNs.Store(tsNs)
+			statsCollect.FilerSyncLagSecondsGauge.WithLabelValues(metricLabels...).Set(0)
 			statsCollect.FilerSyncOffsetGauge.WithLabelValues(sourceFiler.String(), targetFiler.String(), clientName, sourcePath).Set(float64(tsNs))
 		},
 	}

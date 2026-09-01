@@ -301,6 +301,46 @@ var (
 			Help:      "The offset of the filer synchronization service.",
 		}, []string{"sourceFiler", "targetFiler", "clientName", "path"})
 
+	FilerSyncPendingTasksGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: subsystemFilerSync,
+			Name:      "pending_tasks",
+			Help:      "Number of filer synchronization jobs currently in flight.",
+		}, []string{"sourceFiler", "targetFiler", "clientName", "path"})
+
+	FilerSyncLagSecondsGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: subsystemFilerSync,
+			Name:      "lag_seconds",
+			Help:      "Difference between the latest source event and the processed synchronization watermark, in seconds.",
+		}, []string{"sourceFiler", "targetFiler", "clientName", "path"})
+
+	FilerSyncProcessedCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: subsystemFilerSync,
+			Name:      "processed_total",
+			Help:      "Number of filer synchronization jobs completed successfully.",
+		}, []string{"sourceFiler", "targetFiler", "clientName", "path"})
+
+	FilerSyncReceivedCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: subsystemFilerSync,
+			Name:      "received_total",
+			Help:      "Number of metadata events received by the filer synchronization service.",
+		}, []string{"sourceFiler", "targetFiler", "clientName", "path"})
+
+	FilerSyncFailedCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: subsystemFilerSync,
+			Name:      "failed_total",
+			Help:      "Number of filer synchronization jobs that failed after retries.",
+		}, []string{"sourceFiler", "targetFiler", "clientName", "path"})
+
 	VolumeServerStartTimeSeconds = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: Namespace,
@@ -912,6 +952,11 @@ func init() {
 	Gather.MustRegister(FilerStoreCounter)
 	Gather.MustRegister(FilerStoreHistogram)
 	Gather.MustRegister(FilerSyncOffsetGauge)
+	Gather.MustRegister(FilerSyncPendingTasksGauge)
+	Gather.MustRegister(FilerSyncLagSecondsGauge)
+	Gather.MustRegister(FilerSyncProcessedCounter)
+	Gather.MustRegister(FilerSyncReceivedCounter)
+	Gather.MustRegister(FilerSyncFailedCounter)
 	Gather.MustRegister(FilerServerLastSendTsOfSubscribeGauge)
 	Gather.MustRegister(FilerSubscribeGapStalledGauge)
 	Gather.MustRegister(FilerSubscribeUnprovenGapCrossings)

@@ -93,6 +93,12 @@ type MetadataProcessor struct {
 	// past it, so the persisted sync offset stays behind the failure and a
 	// restart replays the event instead of skipping it forever.
 	oldestFailedTsNs int64
+	pendingJobs      atomic.Int64
+
+	// Optional observability hooks. They are intentionally callbacks so the
+	// processor remains independent from the Prometheus package.
+	onPendingChange func(int64)
+	onJobComplete   func(error)
 }
 
 func NewMetadataProcessor(fn pb.ProcessMetadataFunc, concurrency int, offsetTsNs int64) *MetadataProcessor {
@@ -108,6 +114,19 @@ func NewMetadataProcessor(fn pb.ProcessMetadataFunc, concurrency int, offsetTsNs
 	t.processedTsWatermark.Store(offsetTsNs)
 	t.activeJobsCond = sync.NewCond(&t.activeJobsLock)
 	return t
+}
+
+// SetMetricsCallbacks installs optional lifecycle callbacks used by filer.sync
+// metrics. It must be called before the processor starts receiving jobs.
+func (t *MetadataProcessor) SetMetricsCallbacks(onPendingChange func(int64), onJobComplete func(error)) {
+	t.onPendingChange = onPendingChange
+	t.onJobComplete = onJobComplete
+}
+
+func (t *MetadataProcessor) notifyPendingChange() {
+	if t.onPendingChange != nil {
+		t.onPendingChange(t.pendingJobs.Load())
+	}
 }
 
 // pathAncestors returns all proper ancestor directories of p.
@@ -240,6 +259,8 @@ func (t *MetadataProcessor) AddSyncJob(resp *filer_pb.SubscribeMetadataResponse)
 	if filer_pb.IsEmpty(resp) {
 		return
 	}
+	t.pendingJobs.Add(1)
+	t.notifyPendingChange()
 
 	t.activeJobsLock.Lock()
 	defer t.activeJobsLock.Unlock()
@@ -299,7 +320,12 @@ func (t *MetadataProcessor) AddSyncJob(resp *filer_pb.SubscribeMetadataResponse)
 				t.processedTsWatermark.Store(resp.TsNs)
 			}
 		}
+		t.pendingJobs.Add(-1)
+		t.notifyPendingChange()
 		t.activeJobsCond.Signal()
+		if t.onJobComplete != nil {
+			t.onJobComplete(jobErr)
+		}
 	}()
 }
 

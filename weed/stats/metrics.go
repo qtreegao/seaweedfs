@@ -234,6 +234,38 @@ var (
 			Help:      "The last send timestamp of the filer subscription.",
 		}, []string{"sourceFiler", "clientName", "path"})
 
+	// Subscription progress is reported in the metadata log timestamp domain
+	// (Unix nanoseconds). The source head is the newest position currently
+	// readable by the subscription; delivered is the newest metadata position
+	// handed to the client (including explicit empty markers, but not idle
+	// heartbeats). Consumers can
+	// derive a timestamp backlog as source_head - delivered. This is a cursor
+	// distance, not an event count, since counting filtered events would require
+	// scanning the metadata log on every scrape.
+	FilerSubscribeSourceLatestTsGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: subsystemFiler,
+			Name:      "subscribe_source_latest_ts_ns",
+			Help:      "Newest readable metadata log timestamp for a live subscription (Unix nanoseconds).",
+		}, []string{"sourceFiler", "clientName", "path"})
+
+	FilerSubscribeDeliveredTsGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: subsystemFiler,
+			Name:      "subscribe_delivered_ts_ns",
+			Help:      "Newest metadata log timestamp delivered to a live subscription (Unix nanoseconds).",
+		}, []string{"sourceFiler", "clientName", "path"})
+
+	FilerSubscribeBacklogTsGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: subsystemFiler,
+			Name:      "subscribe_backlog_ts_ns",
+			Help:      "Timestamp cursor distance between source latest and delivered subscription positions; not an event count.",
+		}, []string{"sourceFiler", "clientName", "path"})
+
 	FilerSubscribeUnprovenGapCrossings = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: Namespace,
@@ -958,6 +990,9 @@ func init() {
 	Gather.MustRegister(FilerSyncReceivedCounter)
 	Gather.MustRegister(FilerSyncFailedCounter)
 	Gather.MustRegister(FilerServerLastSendTsOfSubscribeGauge)
+	Gather.MustRegister(FilerSubscribeSourceLatestTsGauge)
+	Gather.MustRegister(FilerSubscribeDeliveredTsGauge)
+	Gather.MustRegister(FilerSubscribeBacklogTsGauge)
 	Gather.MustRegister(FilerSubscribeGapStalledGauge)
 	Gather.MustRegister(FilerSubscribeUnprovenGapCrossings)
 	Gather.MustRegister(FilerSubscribeWatermarkHolds)

@@ -161,7 +161,11 @@ type CachedDiskChunk struct {
 
 type LogBuffer struct {
 	// 8-byte aligned fields
-	LastTsNs          atomic.Int64
+	LastTsNs atomic.Int64
+	// lastOriginalTsNs tracks the newest timestamp supplied by the producer.
+	// LastTsNs may be bumped to keep arrival order when timestamps collide;
+	// subscription checkpoints remain in this original timestamp domain.
+	lastOriginalTsNs  atomic.Int64
 	lastFlushTsNs     atomic.Int64
 	lastFlushedOffset atomic.Int64 // Highest offset that has been flushed to disk (-1 = nothing flushed yet)
 	lastEvictedTsNs   atomic.Int64 // Latest stopTime evicted from the sealed ring (0 = nothing evicted yet)
@@ -521,6 +525,9 @@ func (logBuffer *LogBuffer) AddLogEntryToBuffer(logEntry *filer_pb.LogEntry) err
 	if originalTsNs > logBuffer.curWindowMaxOriginalTsNs {
 		logBuffer.curWindowMaxOriginalTsNs = originalTsNs
 	}
+	if originalTsNs > logBuffer.lastOriginalTsNs.Load() {
+		logBuffer.lastOriginalTsNs.Store(originalTsNs)
+	}
 
 	logBuffer.offset++
 	return nil
@@ -646,6 +653,9 @@ func (logBuffer *LogBuffer) AddDataToBuffer(partitionKey, data []byte, processin
 	// eviction watermark in both directions.
 	if originalTsNs > logBuffer.curWindowMaxOriginalTsNs {
 		logBuffer.curWindowMaxOriginalTsNs = originalTsNs
+	}
+	if originalTsNs > logBuffer.lastOriginalTsNs.Load() {
+		logBuffer.lastOriginalTsNs.Store(originalTsNs)
 	}
 
 	logBuffer.offset++
@@ -959,6 +969,13 @@ func (logBuffer *LogBuffer) FlushedThroughTsNs(nowNs int64) int64 {
 // Returns 0 if nothing has been flushed yet.
 func (logBuffer *LogBuffer) GetLastFlushTsNs() int64 {
 	return logBuffer.lastFlushTsNs.Load()
+}
+
+// GetLastOriginalTsNs returns the newest producer timestamp. Unlike LastTsNs,
+// this value is not bumped when arrival timestamps collide and therefore stays
+// in the metadata subscription checkpoint domain.
+func (logBuffer *LogBuffer) GetLastOriginalTsNs() int64 {
+	return logBuffer.lastOriginalTsNs.Load()
 }
 
 // GetLastEvictedOriginalTsNs is GetLastEvictedTsNs in pre-bump timestamps -

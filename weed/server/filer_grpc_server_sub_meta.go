@@ -72,6 +72,52 @@ type metadataStreamSender interface {
 	Send(*filer_pb.SubscribeMetadataResponse) error
 }
 
+// updateSubscribeProgress publishes the two positions that a subscription
+// can observe without rescanning the metadata log. The source head is read
+// from the active local buffer (or the aggregate ring); delivered is advanced
+// only after a response has been handed to the stream. A non-negative cursor
+// distance is exported as a convenience for timestamp-based lag alerts.
+func (fs *FilerServer) updateSubscribeProgress(req *filer_pb.SubscribeMetadataRequest, deliveredTsNs int64, aggregated bool) {
+	if fs == nil || fs.filer == nil {
+		return
+	}
+	var sourceLatest int64
+	if aggregated && fs.filer.MetaAggregator != nil {
+		sourceLatest = fs.filer.MetaAggregator.MetaLogBuffer.GetLastOriginalTsNs()
+	} else if fs.filer.LocalMetaLogBuffer != nil {
+		sourceLatest = fs.filer.LocalMetaLogBuffer.GetLastOriginalTsNs()
+	}
+	sourceFiler := ""
+	if fs.option != nil {
+		sourceFiler = fs.option.Host.String()
+	}
+	clientName, path := req.ClientName, req.PathPrefix
+	stats.FilerSubscribeSourceLatestTsGauge.WithLabelValues(sourceFiler, clientName, path).Set(float64(sourceLatest))
+	stats.FilerSubscribeDeliveredTsGauge.WithLabelValues(sourceFiler, clientName, path).Set(float64(deliveredTsNs))
+	backlog := sourceLatest - deliveredTsNs
+	if backlog < 0 {
+		backlog = 0
+	}
+	stats.FilerSubscribeBacklogTsGauge.WithLabelValues(sourceFiler, clientName, path).Set(float64(backlog))
+}
+
+func (fs *FilerServer) updateSubscribeSourceLatest(req *filer_pb.SubscribeMetadataRequest, aggregated bool) {
+	if fs == nil || fs.filer == nil {
+		return
+	}
+	var sourceLatest int64
+	if aggregated && fs.filer.MetaAggregator != nil {
+		sourceLatest = fs.filer.MetaAggregator.MetaLogBuffer.GetLastOriginalTsNs()
+	} else if fs.filer.LocalMetaLogBuffer != nil {
+		sourceLatest = fs.filer.LocalMetaLogBuffer.GetLastOriginalTsNs()
+	}
+	sourceFiler := ""
+	if fs.option != nil {
+		sourceFiler = fs.option.Host.String()
+	}
+	stats.FilerSubscribeSourceLatestTsGauge.WithLabelValues(sourceFiler, req.ClientName, req.PathPrefix).Set(float64(sourceLatest))
+}
+
 const (
 	// batchBehindThreshold: when an event's timestamp is older than this
 	// relative to wall clock, the sender switches to batch mode for throughput.
@@ -627,14 +673,16 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 	defer gapStall.close()
 
 	var unsyncedEvents int64
-	eachEventNotificationFn := fs.eachEventNotificationFn(req, sender, clientName, &unsyncedEvents)
+	eachEventNotificationFn := fs.eachEventNotificationFn(req, sender, clientName, &unsyncedEvents, true)
 
 	// lastSeenTsNs tracks how far the subscriber has read so idle heartbeats are
 	// only emitted once it is caught up to the buffer head. It is read and
 	// written from this single goroutine, so no synchronization is needed.
 	var lastSeenTsNs int64
 	var lastHeartbeatNs int64
-	baseEachLogEntryFn := eachLogEntryFn(req, sender, eachEventNotificationFn, &unsyncedEvents)
+	baseEachLogEntryFn := eachLogEntryFn(req, sender, eachEventNotificationFn, &unsyncedEvents, func(tsNs int64) {
+		fs.updateSubscribeProgress(req, tsNs, true)
+	})
 	// heldAtTsNs remembers the entry a read was held at (for the log line);
 	// the rewind target is the last entry actually delivered.
 	var heldAtTsNs int64
@@ -745,6 +793,9 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 			}
 			if refsStopTsNs > lastReadTime.Time.UnixNano() {
 				processedTsNs, isDone, readPersistedLogErr = fs.chunkDiskPass(ctx, sender, lastReadTime, refsStopTsNs, sentRefs)
+				if readPersistedLogErr == nil && processedTsNs > lastReadTime.Time.UnixNano() {
+					fs.updateSubscribeProgress(req, processedTsNs, true)
+				}
 			} else {
 				processedTsNs, isDone, readPersistedLogErr = 0, false, nil
 			}
@@ -952,7 +1003,7 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 	defer gapStall.close()
 
 	var unsyncedEvents int64
-	eachEventNotificationFn := fs.eachEventNotificationFn(req, sender, clientName, &unsyncedEvents)
+	eachEventNotificationFn := fs.eachEventNotificationFn(req, sender, clientName, &unsyncedEvents, false)
 
 	// lastSeenTsNs tracks how far the subscriber has read so idle heartbeats are
 	// only emitted once it is caught up to the buffer head. It is read and
@@ -960,7 +1011,9 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 	var lastSeenTsNs int64
 	var lastHeartbeatNs int64
 	var lastFlushReportNs int64
-	baseEachLogEntryFn := eachLogEntryFn(req, sender, eachEventNotificationFn, &unsyncedEvents)
+	baseEachLogEntryFn := eachLogEntryFn(req, sender, eachEventNotificationFn, &unsyncedEvents, func(tsNs int64) {
+		fs.updateSubscribeProgress(req, tsNs, false)
+	})
 	eachLogEntryFn := func(logEntry *filer_pb.LogEntry) (bool, error) {
 		lastSeenTsNs = logEntry.TsNs
 		return baseEachLogEntryFn(logEntry)
@@ -1006,6 +1059,9 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 			glog.V(4).Infof("read on disk %v local subscribe %s from %+v (lastFlushed: %v)", clientName, req.PathPrefix, lastReadTime, time.Unix(0, currentFlushTsNs))
 			if req.ClientSupportsMetadataChunks {
 				processedTsNs, isDone, readPersistedLogErr = fs.chunkDiskPass(ctx, sender, lastReadTime, req.UntilNs, sentRefs)
+				if readPersistedLogErr == nil && processedTsNs > lastReadTime.Time.UnixNano() {
+					fs.updateSubscribeProgress(req, processedTsNs, false)
+				}
 			} else {
 				processedTsNs, isDone, readPersistedLogErr = fs.filer.ReadPersistedLogBuffer(ctx, lastReadTime, req.UntilNs, eachLogEntryFn)
 			}
@@ -1086,7 +1142,11 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 
 }
 
-func eachLogEntryFn(req *filer_pb.SubscribeMetadataRequest, sender metadataStreamSender, eachEventNotificationFn func(dirPath string, eventNotification *filer_pb.EventNotification, tsNs int64) error, filtered *int64) log_buffer.EachLogEntryFuncType {
+func eachLogEntryFn(req *filer_pb.SubscribeMetadataRequest, sender metadataStreamSender, eachEventNotificationFn func(dirPath string, eventNotification *filer_pb.EventNotification, tsNs int64) error, filtered *int64, markDeliveredFns ...func(int64)) log_buffer.EachLogEntryFuncType {
+	markDelivered := func(int64) {}
+	if len(markDeliveredFns) > 0 && markDeliveredFns[0] != nil {
+		markDelivered = markDeliveredFns[0]
+	}
 	// A shallow scan of the path fields skips unmarshaling chunk-heavy events
 	// this subscriber would filter out anyway; scan surprises fall back to the
 	// full decode. Only a delivery resets the shared unsynced-events counter.
@@ -1103,6 +1163,7 @@ func eachLogEntryFn(req *filer_pb.SubscribeMetadataRequest, sender metadataStrea
 					}); err != nil {
 						return false, err
 					}
+					markDelivered(skeleton.TsNs)
 					*filtered = 0
 				}
 				return false, nil
@@ -1373,14 +1434,17 @@ func deltaLogFileRefs(refs []*filer_pb.LogFileChunkRef, sent map[string]sentRefS
 	return out
 }
 
-func (fs *FilerServer) eachEventNotificationFn(req *filer_pb.SubscribeMetadataRequest, sender metadataStreamSender, clientName string, filtered *int64) func(dirPath string, eventNotification *filer_pb.EventNotification, tsNs int64) error {
+func (fs *FilerServer) eachEventNotificationFn(req *filer_pb.SubscribeMetadataRequest, sender metadataStreamSender, clientName string, filtered *int64, aggregatedFns ...bool) func(dirPath string, eventNotification *filer_pb.EventNotification, tsNs int64) error {
+	aggregated := len(aggregatedFns) > 0 && aggregatedFns[0]
 	return func(dirPath string, eventNotification *filer_pb.EventNotification, tsNs int64) error {
+		fs.updateSubscribeSourceLatest(req, aggregated)
 		defer func() {
 			if *filtered > MaxUnsyncedEvents {
 				if err := sender.Send(&filer_pb.SubscribeMetadataResponse{
 					EventNotification: &filer_pb.EventNotification{},
 					TsNs:              tsNs,
 				}); err == nil {
+					fs.updateSubscribeProgress(req, tsNs, aggregated)
 					*filtered = 0
 				}
 			}
@@ -1433,6 +1497,7 @@ func (fs *FilerServer) eachEventNotificationFn(req *filer_pb.SubscribeMetadataRe
 			glog.V(0).Infof("=> client %v: %+v", clientName, err)
 			return err
 		}
+		fs.updateSubscribeProgress(req, tsNs, aggregated)
 		*filtered = 0
 		return nil
 	}

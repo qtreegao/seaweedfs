@@ -37,11 +37,12 @@ func TestEachLogEntryFnPrefilterSkipsDecode(t *testing.T) {
 	sender := &recordingSender{}
 	var decoded int
 	var unsyncedEvents int64
+	var delivered []int64
 	fn := eachLogEntryFn(req, sender, func(dirPath string, eventNotification *filer_pb.EventNotification, tsNs int64) error {
 		decoded++
 		unsyncedEvents = 0 // emulate a delivery, like the notification fn after a send
 		return nil
-	}, &unsyncedEvents)
+	}, &unsyncedEvents, func(ts int64) { delivered = append(delivered, ts) })
 
 	// non-matching entries skip the full decode but keep heartbeating
 	for i := 0; i <= MaxUnsyncedEvents; i++ {
@@ -55,6 +56,9 @@ func TestEachLogEntryFnPrefilterSkipsDecode(t *testing.T) {
 	if len(sender.sent) != 1 {
 		t.Fatalf("expected one unsynced heartbeat, got %d", len(sender.sent))
 	}
+	if len(delivered) != 1 || delivered[0] != int64(MaxUnsyncedEvents+1) {
+		t.Fatalf("empty marker did not advance delivery cursor: %v", delivered)
+	}
 	if hb := sender.sent[0]; hb.TsNs != int64(MaxUnsyncedEvents+1) || len(hb.EventNotification.Signatures) != 0 {
 		t.Fatalf("unexpected heartbeat %+v", hb)
 	}
@@ -65,6 +69,9 @@ func TestEachLogEntryFnPrefilterSkipsDecode(t *testing.T) {
 	}
 	if decoded != 1 {
 		t.Fatalf("matching entry must be decoded and delivered, got %d", decoded)
+	}
+	if len(delivered) != 1 {
+		t.Fatalf("filtered entry should not advance delivery cursor: %v", delivered)
 	}
 
 	// the delivery reset the shared counter: a fresh full window passes
